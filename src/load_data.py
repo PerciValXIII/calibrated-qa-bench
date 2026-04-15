@@ -53,15 +53,13 @@ def sanity_check_squad(dataset):
 def sanity_check_cuad(dataset):
     print_section("CUAD Sanity Check")
 
-    for split in ["train", "test"]:
-        if split not in dataset:
-            print(f"\n  Split '{split}' not found — skipping")
-            continue
+    available_splits = list(dataset.keys())
+    print(f"\n  Available splits: {available_splits}")
 
+    for split in available_splits:
         ds = dataset[split]
         total = len(ds)
 
-        # CUAD answers field is same structure as SQuAD
         answerable   = sum(1 for ex in tqdm(ds, desc=f"  Counting {split}", leave=False)
                           if len(ex["answers"]["text"]) > 0)
         unanswerable = total - answerable
@@ -72,9 +70,10 @@ def sanity_check_cuad(dataset):
         print(f"    Unanswerable       : {unanswerable} ({100*unanswerable/total:.1f}%)")
         print(f"    Fields             : {list(ds.features.keys())}")
 
-    # Spot check one example
-    ex = dataset["test"][0]
-    print(f"\n  Sample example (test[0]):")
+    # Spot check first available split
+    first_split = available_splits[0]
+    ex = dataset[first_split][0]
+    print(f"\n  Sample example ({first_split}[0]):")
     print(f"    Question : {ex['question']}")
     print(f"    Context  : {ex['context'][:120]}...")
     print(f"    Answers  : {ex['answers']}")
@@ -113,7 +112,52 @@ def main():
 
     # ── CUAD ──────────────────────────────────────────────────────────────────
     print_section("Loading CUAD")
-    cuad = load_dataset("theatticusproject/cuad")
+    # Load CUAD from local zip file at data/cuad_dataset/data.zip
+    import zipfile
+    from datasets import Dataset, DatasetDict
+
+    cuad_zip_path = os.path.join("data", "cuad_dataset", "data.zip")
+    print(f"  Reading CUAD from {cuad_zip_path}...")
+
+    def parse_squad_json(file_obj):
+        """Parse a SQuAD-format JSON file into a list of flat rows."""
+        raw = json.load(file_obj)
+        rows = []
+        for article in raw["data"]:
+            title = article.get("title", "")
+            for para in article["paragraphs"]:
+                context = para["context"]
+                for qa in para["qas"]:
+                    answers = qa.get("answers", [])
+                    rows.append({
+                        "id"      : qa["id"],
+                        "title"   : title,
+                        "context" : context,
+                        "question": qa["question"],
+                        "answers" : {
+                            "text"        : [a["text"] for a in answers],
+                            "answer_start" : [a["answer_start"] for a in answers],
+                        }
+                    })
+        return rows
+
+    with zipfile.ZipFile(cuad_zip_path) as z:
+        available = z.namelist()
+        print(f"  Files in zip: {available}")
+
+        # Load train and test splits
+        train_file = next(n for n in available if "train_separate_questions" in n)
+        test_file  = next(n for n in available if n.endswith("test.json"))
+
+        with z.open(train_file) as f:
+            train_rows = parse_squad_json(f)
+        with z.open(test_file) as f:
+            test_rows = parse_squad_json(f)
+
+    cuad = DatasetDict({
+        "train": Dataset.from_list(train_rows),
+        "test" : Dataset.from_list(test_rows),
+    })
     print("  Loaded CUAD ✓")
 
     sanity_check_cuad(cuad)
