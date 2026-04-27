@@ -63,8 +63,17 @@ def print_section(title):
 
 
 def normalize_confidence(predictions):
+    """
+    Normalize raw span scores to [0,1].
+    Uses min-max normalization to handle different logit scales across models.
+    RoBERTa-large produces much larger logit sums than base — sigmoid saturates.
+    Min-max preserves the relative ordering while making scores comparable.
+    """
     scores = np.array([ex["confidence"] for ex in predictions])
-    return 1 / (1 + np.exp(-scores))
+    s_min, s_max = scores.min(), scores.max()
+    if s_max == s_min:
+        return np.ones_like(scores) * 0.5
+    return (scores - s_min) / (s_max - s_min)
 
 
 def normalize_answer(s):
