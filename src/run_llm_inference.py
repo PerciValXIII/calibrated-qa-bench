@@ -352,23 +352,10 @@ if __name__ == "__main__":
     squad    = load_dataset("rajpurkar/squad_v2")["validation"]
     examples = stratified_sample(squad, SAMPLE_SIZE)
 
-    # Smoke test on 3 examples
-    print("\nSmoke test (3 examples)...")
-    smoke_results = run_inference(examples[:3], tokenizer, model)
-    for r in smoke_results:
-        print(f"  Q: {r['question'][:60]}")
-        print(f"  A: {r['pred_answer']}")
-        print(f"  logprob conf : {r['confidence']}")
-        print(f"  verbal conf  : {r['verbalized_conf']}")
-        print()
+    # Full run
+    print(f"\nStarting full run on {len(examples)} examples...")
+    results = run_inference(examples, tokenizer, model)
 
-    confirm = input("Smoke test looks good? Type 'yes' to start full run: ")
-    if confirm.strip().lower() != "yes":
-        print("Aborted.")
-    else:
-        print(f"\nStarting full run on {len(examples)} examples...")
-        results = run_inference(examples, tokenizer, model)
-
-        with open(FINAL_PATH, "w") as f:
-            json.dump(results, f)
-        print(f"\n✓ Final predictions saved → {FINAL_PATH}")
+    with open(FINAL_PATH, "w") as f:
+        json.dump(results, f)
+    print(f"\n✓ Final predictions saved → {FINAL_PATH}")
