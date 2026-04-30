@@ -20,8 +20,9 @@ from tqdm import tqdm
 PREDICTIONS_DIR = os.path.join("outputs", "predictions")
 
 INPUT_FILES = {
-    "squad": "squad_predictions.json",
-    "cuad" : "cuad_predictions.json",
+    "squad"      : "squad_predictions.json",
+    "cuad"       : "cuad_predictions.json",
+    "llama_squad": "llama_squad_predictions.json",   # LLM predictions
 }
 
 
@@ -68,7 +69,6 @@ def get_answer_length(gold_answers: list, pred_answer: str, is_answerable: bool)
     if not is_answerable:
         return "none"
 
-    # Use first gold answer if available
     text = gold_answers[0] if gold_answers else pred_answer
     if not text:
         return "none"

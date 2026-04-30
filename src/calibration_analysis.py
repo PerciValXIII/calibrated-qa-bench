@@ -5,6 +5,9 @@ Computes calibration metrics and produces figures:
   - Reliability diagrams (global + per subgroup)
   - Confidence distributions per subgroup
 
+Supports both extractive QA models (sigmoid normalization) and
+generative LLMs (min-max normalization on log probabilities).
+
 Usage: python src/calibration_analysis.py
 """
 
@@ -44,25 +47,68 @@ def print_section(title):
     print(f"{'='*50}")
 
 
-def normalize_confidence(predictions):
+def detect_model_type(predictions):
     """
-    Normalize raw span scores to [0,1] using sigmoid.
-    Raw logit sums can be any real number — sigmoid maps them to a probability.
+    Detect whether predictions are from an extractive model or generative LLM.
+    LLM predictions have a 'model' field set to the model name string.
+    Extractive predictions have start_logits/end_logits fields.
+    """
+    if predictions and predictions[0].get("model"):
+        return "llm"
+    return "extractive"
+
+
+def normalize_confidence_extractive(predictions):
+    """
+    Sigmoid normalization for extractive model span scores.
+    Raw logit sums can be any real number — sigmoid maps to [0,1].
     """
     scores = np.array([ex["confidence"] for ex in predictions])
     return 1 / (1 + np.exp(-scores))
 
 
-def is_correct(ex):
+def normalize_confidence_llm(predictions):
     """
-    Binary correctness: 1 if prediction matches any gold answer (F1 > 0.5),
-    0 otherwise. For unanswerable, correct iff pred is empty.
+    Min-max normalization for LLM mean log probabilities.
+    Log probs are in (-inf, 0] — min-max maps to [0,1].
+    More negative = less confident → lower normalized score.
     """
-    import string, re
+    scores = np.array([
+        ex["confidence"] for ex in predictions
+        if ex["confidence"] is not None
+    ])
+    s_min, s_max = scores.min(), scores.max()
+
+    normalized = []
+    for ex in predictions:
+        if ex["confidence"] is None:
+            normalized.append(0.0)
+        else:
+            # min-max normalize: higher (less negative) logprob → higher confidence
+            normalized.append(
+                (ex["confidence"] - s_min) / (s_max - s_min + 1e-9)
+            )
+    return np.array(normalized)
+
+
+def normalize_confidence(predictions, model_type):
+    """Route to correct normalization based on model type."""
+    if model_type == "llm":
+        return normalize_confidence_llm(predictions)
+    return normalize_confidence_extractive(predictions)
+
+
+def is_correct_extractive(ex):
+    """
+    F1-based correctness for extractive models.
+    Unanswerable: correct iff pred is empty string.
+    """
+    import string
     from collections import Counter
 
     def normalize(s):
         s = s.lower()
+        import re
         s = re.sub(r'\b(a|an|the)\b', ' ', s)
         s = ''.join(c for c in s if c not in string.punctuation)
         return ' '.join(s.split())
@@ -77,11 +123,11 @@ def is_correct(ex):
         rec  = sum(common.values()) / len(g)
         return 2 * prec * rec / (prec + rec)
 
-    pred = ex["pred_answer"]
+    pred  = ex["pred_answer"]
     golds = ex["gold_answers"]
 
     if not ex["is_answerable"]:
-        return int(pred.strip() == "")
+        return int(pred.strip() == "")      # extractive: correct = empty string
 
     if not golds:
         return 0
@@ -89,13 +135,58 @@ def is_correct(ex):
     return int(max(f1(g, pred) for g in golds) > 0.5)
 
 
+def is_correct_llm(ex):
+    """
+    F1-based correctness for LLM predictions.
+    Unanswerable: correct iff pred is 'unanswerable' (LLM outputs a word, not empty).
+    Answerable: same F1 > 0.5 check as extractive.
+    """
+    import string
+    from collections import Counter
+
+    def normalize(s):
+        s = s.lower()
+        import re
+        s = re.sub(r'\b(a|an|the)\b', ' ', s)
+        s = ''.join(c for c in s if c not in string.punctuation)
+        return ' '.join(s.split())
+
+    def f1(gold, pred):
+        g = normalize(gold).split()
+        p = normalize(pred).split()
+        common = Counter(g) & Counter(p)
+        if not common:
+            return 0.0
+        prec = sum(common.values()) / len(p)
+        rec  = sum(common.values()) / len(g)
+        return 2 * prec * rec / (prec + rec)
+
+    pred  = ex["pred_answer"].strip().lower()
+    golds = ex["gold_answers"]
+
+    if not ex["is_answerable"]:
+        return int(pred == "unanswerable")  # LLM: correct = outputs the word
+
+    if not golds:
+        return 0
+
+    return int(max(f1(g, pred) for g in golds) > 0.5)
+
+
+def compute_correctness(predictions, model_type):
+    """Route to correct is_correct function based on model type."""
+    if model_type == "llm":
+        return np.array([is_correct_llm(ex) for ex in predictions])
+    return np.array([is_correct_extractive(ex) for ex in predictions])
+
+
 def compute_ece(confidences, correctness, n_bins=N_BINS):
     """
     Expected Calibration Error.
     Bins predictions by confidence, measures |avg_confidence - avg_accuracy| per bin.
     """
-    bins = np.linspace(0, 1, n_bins + 1)
-    ece  = 0.0
+    bins     = np.linspace(0, 1, n_bins + 1)
+    ece      = 0.0
     bin_data = []
 
     for i in range(n_bins):
@@ -154,24 +245,20 @@ def plot_reliability_diagram(bin_data, ece, title, save_path, color=COLORS[0]):
 
     fig, ax = plt.subplots(figsize=(5, 5))
 
-    # Draw accuracy bars
     ax.bar(bin_mids, avg_accs, width=bar_width,
            color=color, alpha=0.85, label="Actual accuracy",
            zorder=2, align="center", edgecolor="white", linewidth=0.5)
 
-    # Draw confidence gap on top (overconfidence = positive gap)
     gap = avg_confs - avg_accs
     ax.bar(bin_mids, np.maximum(gap, 0), bottom=avg_accs,
            width=bar_width, color="#D55E00", alpha=0.4,
            label="Overconfidence gap", zorder=3,
            align="center", edgecolor="white", linewidth=0.5)
-    # Underconfidence gap (negative gap — accuracy exceeds confidence)
     ax.bar(bin_mids, np.maximum(-gap, 0), bottom=avg_confs,
            width=bar_width, color="#009E73", alpha=0.4,
            label="Underconfidence gap", zorder=3,
            align="center", edgecolor="white", linewidth=0.5)
 
-    # Perfect calibration line
     ax.plot([0, 1], [0, 1], "k--", linewidth=1.2,
             label="Perfect calibration", zorder=4)
 
@@ -182,10 +269,6 @@ def plot_reliability_diagram(bin_data, ece, title, save_path, color=COLORS[0]):
     ax.set_title(f"{title}\nECE = {ece:.4f}", fontsize=13, fontweight="bold")
     ax.legend(fontsize=8, loc="upper left")
     ax.grid(alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close()
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
@@ -239,7 +322,6 @@ def plot_subgroup_reliability(subgroup_results, axis_name, domain, save_path):
         ax.set_ylabel("Accuracy", fontsize=9)
         ax.grid(alpha=0.3)
 
-    # Hide unused axes
     for idx in range(len(labels), len(axes)):
         axes[idx].set_visible(False)
 
@@ -261,7 +343,7 @@ def plot_confidence_distribution(predictions, confidences, domain, save_path):
     ax.hist(ans_conf,   bins=bins, alpha=0.65, color=COLORS[0], label="Answerable",   density=True)
     ax.hist(unans_conf, bins=bins, alpha=0.65, color=COLORS[1], label="Unanswerable", density=True)
 
-    ax.set_xlabel("Confidence (sigmoid-normalized)", fontsize=12)
+    ax.set_xlabel("Confidence (normalized)", fontsize=12)
     ax.set_ylabel("Density", fontsize=12)
     ax.set_title(f"{domain} — Confidence Distribution", fontsize=13, fontweight="bold")
     ax.legend(fontsize=10)
@@ -276,10 +358,12 @@ def plot_confidence_distribution(predictions, confidences, domain, save_path):
 # ── Core Analysis ─────────────────────────────────────────────────────────────
 
 def analyse_dataset(predictions, domain):
-    print(f"\n  Computing correctness and confidence for {len(predictions)} examples...")
+    model_type = detect_model_type(predictions)
+    print(f"\n  Model type        : {model_type}")
+    print(f"  Computing correctness and confidence for {len(predictions)} examples...")
 
-    confidences = normalize_confidence(predictions)
-    correctness = np.array([is_correct(ex) for ex in predictions])
+    confidences = normalize_confidence(predictions, model_type)
+    correctness = compute_correctness(predictions, model_type)
 
     print(f"  Overall accuracy  : {correctness.mean():.4f}")
     print(f"  Mean confidence   : {confidences.mean():.4f}")
@@ -294,7 +378,6 @@ def analyse_dataset(predictions, domain):
     print(f"\n  Global ECE : {ece:.4f}")
     print(f"  Global MCE : {mce:.4f}")
 
-    # Global reliability diagram
     plot_reliability_diagram(
         bin_data, ece,
         title    = f"{domain} — Global Reliability Diagram",
@@ -303,7 +386,6 @@ def analyse_dataset(predictions, domain):
     )
     print(f"  Saved → {domain.lower()}_reliability_global.png")
 
-    # Confidence distribution
     plot_confidence_distribution(
         predictions, confidences, domain,
         save_path=os.path.join(FIGURES_DIR, f"{domain.lower()}_confidence_dist.png"),
@@ -329,19 +411,18 @@ def analyse_dataset(predictions, domain):
             g_mce             = compute_mce(c, a)
 
             subgroup_results[label] = {
-                "ece"     : g_ece,
-                "mce"     : g_mce,
-                "n"       : len(indices),
-                "accuracy": float(a.mean()),
+                "ece"      : g_ece,
+                "mce"      : g_mce,
+                "n"        : len(indices),
+                "accuracy" : float(a.mean()),
                 "mean_conf": float(c.mean()),
-                "bin_data": g_bin_data,
+                "bin_data" : g_bin_data,
             }
 
             print(f"    {label:<20} n={len(indices):<6} ECE={g_ece:.4f}  acc={a.mean():.3f}  conf={c.mean():.3f}")
 
         results[axis_key] = subgroup_results
 
-        # Subgroup reliability diagram grid
         plot_subgroup_reliability(
             subgroup_results, axis_name, domain,
             save_path=os.path.join(FIGURES_DIR, f"{domain.lower()}_reliability_{axis_key}.png"),
@@ -358,8 +439,9 @@ def main():
     all_results = {}
 
     for domain, filename in [
-        ("SQuAD", "squad_predictions_tagged.json"),
-        ("CUAD",  "cuad_predictions_tagged.json"),
+        ("SQuAD",       "squad_predictions_tagged.json"),
+        ("CUAD",        "cuad_predictions_tagged.json"),
+        ("Llama_SQuAD", "llama_squad_predictions_tagged.json"),
     ]:
         path = os.path.join(PREDICTIONS_DIR, filename)
         if not os.path.exists(path):
@@ -372,7 +454,6 @@ def main():
         all_results[domain] = results
 
     # ── Save metrics ──────────────────────────────────────────────────────────
-    # Strip bin_data before saving (too large)
     saveable = {}
     for domain, domain_results in all_results.items():
         saveable[domain] = {}
